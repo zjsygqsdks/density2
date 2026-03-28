@@ -2,6 +2,9 @@
 
 A machine-learning pipeline that reconstructs the **3-D spatial distribution of airborne dust** from six synchronized camera videos using Neural Radiance Fields (NeRF).
 
+> 📖 **深度技术文档（程序原理与完整运行流程）**：请阅读 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)  
+> 📖 **In-depth technical documentation** (program principles & complete run flow): see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
 ---
 
 ## Overview
