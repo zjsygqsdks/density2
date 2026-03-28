@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pth
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data (not committed — too large)
+data/
+
+# Outputs
+outputs/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
