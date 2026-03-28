@@ -1,9 +1,34 @@
 """
 dataset.py — Video loading, frame extraction, background estimation,
              dust mask generation, and ray generation for DustNeRF.
+
+Supports two config formats
+---------------------------
+New format (``train_videos[]``):
+    {
+        "file_name": "train00.mp4",
+        "frame_rate": 25.0,
+        "frame_num": 113,
+        "camera_angle_x": 0.389208,
+        "camera_hw": [720, 1280],
+        "transform_matrix": [...]
+    }
+
+Legacy format (``cameras[]``):
+    {
+        "id": "train00",
+        "fl_x": 800.0, "fl_y": 800.0,
+        "cx": 540.0,   "cy": 360.0,
+        "w": 1080,     "h": 720,
+        "transform_matrix": [...]
+    }
+
+Both formats are normalised to the same internal representation before
+further processing.
 """
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -15,7 +40,7 @@ from torch.utils.data import Dataset
 
 
 # ---------------------------------------------------------------------------
-# Camera helpers
+# Config loading & format normalisation
 # ---------------------------------------------------------------------------
 
 def load_config(config_path: str) -> dict:
@@ -24,19 +49,84 @@ def load_config(config_path: str) -> dict:
         return json.load(f)
 
 
-def get_intrinsics(cam_cfg: dict) -> np.ndarray:
-    """Return 3×3 intrinsic matrix K from a camera config entry."""
-    K = np.array([
-        [cam_cfg["fl_x"],           0.0, cam_cfg["cx"]],
-        [          0.0, cam_cfg["fl_y"], cam_cfg["cy"]],
-        [          0.0,           0.0,           1.0],
+def normalize_camera_entry(entry: dict) -> dict:
+    """
+    Normalise a single camera entry to the internal representation.
+
+    Accepts either the new ``train_videos`` format (with ``camera_angle_x``
+    and ``camera_hw``) or the legacy ``cameras`` format (with ``fl_x`` etc.)
+    and always returns a dict with keys:
+        id, fl_x, fl_y, cx, cy, w, h,
+        transform_matrix, frame_rate, frame_num
+    """
+    if "camera_angle_x" in entry and "camera_hw" in entry:
+        # ---- New format ----
+        H, W = entry["camera_hw"]
+        angle_x = entry["camera_angle_x"]
+        fl_x = W / (2.0 * math.tan(angle_x / 2.0))
+        # derive angle_y from the horizontal angle and aspect ratio
+        angle_y = 2.0 * math.atan(math.tan(angle_x / 2.0) * H / W)
+        fl_y = H / (2.0 * math.tan(angle_y / 2.0))
+        file_name = entry["file_name"]
+        cam_id = Path(file_name).stem          # "train00.mp4" → "train00"
+        return {
+            "id":               cam_id,
+            "file_name":        file_name,
+            "fl_x":             fl_x,
+            "fl_y":             fl_y,
+            "cx":               W / 2.0,
+            "cy":               H / 2.0,
+            "w":                W,
+            "h":                H,
+            "transform_matrix": entry["transform_matrix"],
+            "frame_rate":       float(entry.get("frame_rate", 25.0)),
+            "frame_num":        int(entry.get("frame_num", 1)),
+        }
+    else:
+        # ---- Legacy format ----
+        return {
+            "id":               entry["id"],
+            "file_name":        entry["id"] + ".mp4",
+            "fl_x":             float(entry["fl_x"]),
+            "fl_y":             float(entry["fl_y"]),
+            "cx":               float(entry["cx"]),
+            "cy":               float(entry["cy"]),
+            "w":                int(entry["w"]),
+            "h":                int(entry["h"]),
+            "transform_matrix": entry["transform_matrix"],
+            "frame_rate":       float(entry.get("frame_rate", 25.0)),
+            "frame_num":        int(entry.get("frame_num",
+                                              entry.get("frames_per_video", 60))),
+        }
+
+
+def get_camera_entries(cfg: dict) -> List[dict]:
+    """
+    Return a list of normalised camera entries from either config format.
+
+    Tries ``train_videos`` first (new format), then falls back to
+    ``cameras`` (legacy format).
+    """
+    raw_list = cfg.get("train_videos") or cfg.get("cameras", [])
+    return [normalize_camera_entry(e) for e in raw_list]
+
+
+# ---------------------------------------------------------------------------
+# Intrinsics / extrinsics helpers
+# ---------------------------------------------------------------------------
+
+def get_intrinsics(cam: dict) -> np.ndarray:
+    """Return 3×3 intrinsic matrix K from a normalised camera entry."""
+    return np.array([
+        [cam["fl_x"], 0.0,       cam["cx"]],
+        [0.0,         cam["fl_y"], cam["cy"]],
+        [0.0,         0.0,         1.0      ],
     ], dtype=np.float32)
-    return K
 
 
-def get_c2w(cam_cfg: dict) -> np.ndarray:
+def get_c2w(cam: dict) -> np.ndarray:
     """Return 4×4 camera-to-world matrix (NeRF convention)."""
-    return np.array(cam_cfg["transform_matrix"], dtype=np.float32)
+    return np.array(cam["transform_matrix"], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +145,8 @@ class BackgroundEstimator:
         frames : list of H×W×3 uint8 arrays
         Returns : H×W×3 float32 background in [0,1]
         """
-        stack = np.stack([f.astype(np.float32) / 255.0 for f in frames[:self.n_frames]], axis=0)
+        stack = np.stack([f.astype(np.float32) / 255.0
+                          for f in frames[:self.n_frames]], axis=0)
         if self.method == "median":
             bg = np.median(stack, axis=0)
         elif self.method == "mean":
@@ -66,34 +157,36 @@ class BackgroundEstimator:
 
 
 # ---------------------------------------------------------------------------
-# Video reader
+# Video / frame-directory reader
 # ---------------------------------------------------------------------------
 
 def extract_frames(
     video_path: str,
     max_frames: int = 120,
-    frame_skip: int = 5,
+    frame_skip: int = 1,
     resize: Optional[Tuple[int, int]] = None,
-) -> List[np.ndarray]:
+) -> Tuple[List[np.ndarray], List[int]]:
     """
     Read frames from a video file.
 
     Parameters
     ----------
-    video_path : path to .mp4/.avi/etc.
-    max_frames : maximum total frames to extract
-    frame_skip : take every Nth frame
-    resize     : (W, H) to resize frames, or None to keep original
+    video_path  : path to .mp4/.avi/etc.
+    max_frames  : maximum total frames to extract
+    frame_skip  : take every Nth frame (1 = every frame)
+    resize      : (W, H) to resize frames, or None to keep original
 
     Returns
     -------
-    list of H×W×3 uint8 BGR frames
+    frames     : list of H×W×3 uint8 BGR frames
+    frame_idxs : list of original video frame indices for each returned frame
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Cannot open video: {video_path}")
 
-    frames = []
+    frames: List[np.ndarray] = []
+    frame_idxs: List[int] = []
     idx = 0
     while len(frames) < max_frames:
         ret, frame = cap.read()
@@ -103,26 +196,29 @@ def extract_frames(
             if resize is not None:
                 frame = cv2.resize(frame, resize, interpolation=cv2.INTER_AREA)
             frames.append(frame)
+            frame_idxs.append(idx)
         idx += 1
     cap.release()
-    return frames
+    return frames, frame_idxs
 
 
 def extract_frames_from_dir(
     frame_dir: str,
     max_frames: int = 120,
-    frame_skip: int = 5,
+    frame_skip: int = 1,
     resize: Optional[Tuple[int, int]] = None,
     extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg"),
-) -> List[np.ndarray]:
+) -> Tuple[List[np.ndarray], List[int]]:
     """
     Load pre-extracted image frames from a directory (fallback when no video).
+    Returns (frames, frame_idxs) where frame_idxs are original file indices.
     """
     paths = sorted([
         p for p in Path(frame_dir).iterdir()
         if p.suffix.lower() in extensions
     ])
-    frames = []
+    frames: List[np.ndarray] = []
+    frame_idxs: List[int] = []
     for i, p in enumerate(paths):
         if len(frames) >= max_frames:
             break
@@ -134,43 +230,51 @@ def extract_frames_from_dir(
         if resize is not None:
             img = cv2.resize(img, resize, interpolation=cv2.INTER_AREA)
         frames.append(img)
-    return frames
+        frame_idxs.append(i)
+    return frames, frame_idxs
 
 
 def load_camera_frames(
     data_root: str,
-    cam_id: str,
+    cam: dict,
     cfg_training: dict,
-    cam_wh: Optional[Tuple[int, int]] = None,
-) -> List[np.ndarray]:
+) -> Tuple[List[np.ndarray], List[int]]:
     """
     Attempt to load frames for a given camera from video or image directory.
-    Looks for: <data_root>/<cam_id>.mp4  OR  <data_root>/<cam_id>/
+
+    Looks for: <data_root>/<file_name>   (e.g. train00.mp4)
+           OR: <data_root>/<id>/         (frame image directory)
+
+    Returns (frames, frame_idxs).
     """
-    max_frames = cfg_training.get("frames_per_video", 60)
-    frame_skip = cfg_training.get("frame_skip", 5)
+    cam_id = cam["id"]
+    file_name = cam.get("file_name", cam_id + ".mp4")
+    W, H = cam["w"], cam["h"]
 
-    video_exts = (".mp4", ".avi", ".mov", ".mkv")
-    video_path = None
-    for ext in video_exts:
-        candidate = os.path.join(data_root, cam_id + ext)
-        if os.path.isfile(candidate):
-            video_path = candidate
-            break
+    max_frames = cfg_training.get("frames_per_video",
+                                  cam.get("frame_num", 60))
+    frame_skip = cfg_training.get("frame_skip", 1)
 
+    # Try video file named exactly as file_name, then by id with common exts
+    candidates = [os.path.join(data_root, file_name)]
+    if not os.path.isfile(candidates[0]):
+        for ext in (".mp4", ".avi", ".mov", ".mkv"):
+            candidates.append(os.path.join(data_root, cam_id + ext))
+
+    video_path = next((c for c in candidates if os.path.isfile(c)), None)
     if video_path is not None:
         return extract_frames(video_path, max_frames=max_frames,
-                              frame_skip=frame_skip, resize=cam_wh)
+                              frame_skip=frame_skip, resize=(W, H))
 
     frame_dir = os.path.join(data_root, cam_id)
     if os.path.isdir(frame_dir):
         return extract_frames_from_dir(frame_dir, max_frames=max_frames,
-                                       frame_skip=frame_skip, resize=cam_wh)
+                                       frame_skip=frame_skip, resize=(W, H))
 
     raise FileNotFoundError(
         f"No video or frame directory found for camera '{cam_id}' "
         f"under '{data_root}'. "
-        f"Expected '{data_root}/{cam_id}.mp4' or '{data_root}/{cam_id}/'."
+        f"Expected '{data_root}/{file_name}' or '{data_root}/{cam_id}/'."
     )
 
 
@@ -178,7 +282,9 @@ def load_camera_frames(
 # Ray generation
 # ---------------------------------------------------------------------------
 
-def get_rays(H: int, W: int, K: np.ndarray, c2w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def get_rays(
+    H: int, W: int, K: np.ndarray, c2w: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generate per-pixel rays in world space.
 
@@ -188,18 +294,15 @@ def get_rays(H: int, W: int, K: np.ndarray, c2w: np.ndarray) -> Tuple[np.ndarray
     rays_d : (H*W, 3) ray directions (unit vectors)
     """
     i, j = np.meshgrid(np.arange(W, dtype=np.float32),
-                       np.arange(H, dtype=np.float32), indexing="xy")
-    # un-project to camera space
+                        np.arange(H, dtype=np.float32), indexing="xy")
     dirs = np.stack([
         (i - K[0, 2]) / K[0, 0],
         -(j - K[1, 2]) / K[1, 1],
         -np.ones_like(i),
-    ], axis=-1)  # H×W×3
-    # rotate to world space
+    ], axis=-1)                                            # H×W×3
     rays_d = (c2w[:3, :3] @ dirs[..., np.newaxis]).squeeze(-1)  # H×W×3
-    # normalise
     rays_d = rays_d / (np.linalg.norm(rays_d, axis=-1, keepdims=True) + 1e-8)
-    rays_o = np.broadcast_to(c2w[:3, 3], rays_d.shape).copy()  # H×W×3
+    rays_o = np.broadcast_to(c2w[:3, 3], rays_d.shape).copy()   # H×W×3
     return rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
 
 
@@ -227,7 +330,7 @@ def compute_dust_weight(
     """
     frame_f = frame_bgr.astype(np.float32) / 255.0
     diff = np.abs(frame_f - background_bgr)
-    weight = diff.mean(axis=-1)           # average over RGB channels
+    weight = diff.mean(axis=-1)
     weight = np.clip(weight - threshold, 0.0, None)
     max_w = weight.max()
     if max_w > 0:
@@ -241,9 +344,21 @@ def compute_dust_weight(
 
 class DustDataset(Dataset):
     """
-    PyTorch dataset that provides (ray_origin, ray_direction, rgb, dust_weight) tuples.
+    PyTorch dataset providing (ray_origin, ray_direction, rgb, dust_weight,
+    frame_idx) tuples for every pixel of every frame of every camera.
 
-    Each sample is one pixel/ray from one frame of one camera.
+    ``frame_idx`` is the **original video frame number** (0-based), shared
+    across all cameras at the same time step.  It is used as a time index
+    for the temporal dust-probability head in DustNeRF.
+
+    Attributes
+    ----------
+    n_frames : int
+        Total number of distinct temporal frames across all cameras
+        (= ``frame_num`` from config, or the maximum observed).
+    frame_times : np.ndarray
+        (n_frames,) array of timestamps in seconds, computed from
+        ``frame_rate``.  All cameras are assumed synchronised.
     """
 
     def __init__(
@@ -263,21 +378,29 @@ class DustDataset(Dataset):
 
         bg_estimator = BackgroundEstimator(n_frames=bg_frames, method=bg_method)
 
-        all_rays_o: List[np.ndarray] = []
-        all_rays_d: List[np.ndarray] = []
-        all_rgb: List[np.ndarray] = []
-        all_weight: List[np.ndarray] = []
+        all_rays_o:    List[np.ndarray] = []
+        all_rays_d:    List[np.ndarray] = []
+        all_rgb:       List[np.ndarray] = []
+        all_weight:    List[np.ndarray] = []
+        all_frame_idx: List[np.ndarray] = []
 
+        max_frame_idx = 0
+        frame_rate = 25.0   # default; overwritten by first camera entry
+
+        camera_entries = get_camera_entries(self.cfg)
         print(f"[DustDataset] Loading data from '{data_root}' …")
-        for cam_cfg in self.cfg["cameras"]:
-            cam_id = cam_cfg["id"]
-            H, W = cam_cfg["h"], cam_cfg["w"]
-            K = get_intrinsics(cam_cfg)
-            c2w = get_c2w(cam_cfg)
+
+        for cam in camera_entries:
+            cam_id = cam["id"]
+            H, W   = cam["h"], cam["w"]
+            K      = get_intrinsics(cam)
+            c2w    = get_c2w(cam)
+            frame_rate = cam["frame_rate"]
 
             # ----- load frames -----
             try:
-                frames = load_camera_frames(data_root, cam_id, cfg_train, cam_wh=(W, H))
+                frames, orig_frame_idxs = load_camera_frames(
+                    data_root, cam, cfg_train)
             except FileNotFoundError as e:
                 print(f"  [WARN] {e}  — skipping camera {cam_id}")
                 continue
@@ -286,7 +409,9 @@ class DustDataset(Dataset):
                 print(f"  [WARN] No frames found for {cam_id} — skipping")
                 continue
 
-            print(f"  [{cam_id}] loaded {len(frames)} frames  (H={H}, W={W})")
+            print(f"  [{cam_id}] loaded {len(frames)} frames"
+                  f"  (H={H}, W={W},"
+                  f" frames {orig_frame_idxs[0]}–{orig_frame_idxs[-1]})")
 
             # ----- background estimation -----
             bg_bgr = bg_estimator.estimate(frames)
@@ -295,44 +420,65 @@ class DustDataset(Dataset):
             rays_o, rays_d = get_rays(H, W, K, c2w)
 
             # ----- per-frame rays -----
-            for frame in frames:
-                # resize frame to configured resolution
-                frame_resized = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
-                # RGB in [0,1]
-                rgb = frame_resized[:, :, ::-1].astype(np.float32) / 255.0  # BGR→RGB
-                rgb_flat = rgb.reshape(-1, 3)
-                # dust weight
-                weight = compute_dust_weight(frame_resized, bg_bgr, threshold=dust_threshold)
+            for frame, orig_idx in zip(frames, orig_frame_idxs):
+                frame_resized = cv2.resize(frame, (W, H),
+                                           interpolation=cv2.INTER_AREA)
+                rgb = frame_resized[:, :, ::-1].astype(np.float32) / 255.0
+                rgb_flat    = rgb.reshape(-1, 3)
+                weight      = compute_dust_weight(frame_resized, bg_bgr,
+                                                  threshold=dust_threshold)
                 weight_flat = weight.reshape(-1)
+
+                n_px = H * W
+                fidx_flat = np.full(n_px, orig_idx, dtype=np.int64)
 
                 all_rays_o.append(rays_o)
                 all_rays_d.append(rays_d)
                 all_rgb.append(rgb_flat)
                 all_weight.append(weight_flat)
+                all_frame_idx.append(fidx_flat)
+
+                if orig_idx > max_frame_idx:
+                    max_frame_idx = orig_idx
 
         if not all_rays_o:
             raise RuntimeError(
-                "No data loaded. Check that data_root contains video files or frame directories "
-                "named 'train00', 'train01', …, 'train05'."
+                "No data loaded.  Check that data_root contains video files or "
+                "frame directories named 'train00', 'train01', … "
+                "(or matching file_name fields in config)."
             )
 
-        self.rays_o = torch.from_numpy(np.concatenate(all_rays_o, axis=0))   # N×3
-        self.rays_d = torch.from_numpy(np.concatenate(all_rays_d, axis=0))   # N×3
-        self.rgb    = torch.from_numpy(np.concatenate(all_rgb,    axis=0))   # N×3
-        self.weight = torch.from_numpy(np.concatenate(all_weight, axis=0))   # N
+        self.rays_o    = torch.from_numpy(np.concatenate(all_rays_o,    axis=0))
+        self.rays_d    = torch.from_numpy(np.concatenate(all_rays_d,    axis=0))
+        self.rgb       = torch.from_numpy(np.concatenate(all_rgb,       axis=0))
+        self.weight    = torch.from_numpy(np.concatenate(all_weight,    axis=0))
+        self.frame_idx = torch.from_numpy(np.concatenate(all_frame_idx, axis=0))
+
+        # Total number of distinct time steps.
+        # Use the maximum frame_num declared in any camera entry (all cameras
+        # are synchronised, so they should all have the same value).  Fall back
+        # to the highest observed frame index + 1 if no camera declares frame_num.
+        declared_frame_num = max(
+            (cam.get("frame_num", 0) for cam in camera_entries),
+            default=0,
+        )
+        self.n_frames = int(declared_frame_num) if declared_frame_num > 0 \
+                        else (max_frame_idx + 1)
+        self.frame_times = np.arange(self.n_frames, dtype=np.float32) / frame_rate
 
         total = len(self.rays_o)
-        print(f"[DustDataset] Total rays: {total:,}")
+        print(f"[DustDataset] Total rays: {total:,}  |  n_frames={self.n_frames}")
 
     def __len__(self) -> int:
         return len(self.rays_o)
 
     def __getitem__(self, idx):
         return {
-            "rays_o": self.rays_o[idx],
-            "rays_d": self.rays_d[idx],
-            "rgb":    self.rgb[idx],
-            "weight": self.weight[idx],
+            "rays_o":    self.rays_o[idx],
+            "rays_d":    self.rays_d[idx],
+            "rgb":       self.rgb[idx],
+            "weight":    self.weight[idx],
+            "frame_idx": self.frame_idx[idx],
         }
 
     # ------------------------------------------------------------------
