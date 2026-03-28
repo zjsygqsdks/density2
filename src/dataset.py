@@ -2,8 +2,19 @@
 dataset.py — Video loading, frame extraction, background estimation,
              dust mask generation, and ray generation for DustNeRF.
 
-Supports two config formats
----------------------------
+Configuration split
+-------------------
+Training hyper-parameters (near, far, batch_rays, …) are read from the
+project-level config file (``config/info.json`` by default).
+
+Camera poses and video metadata are read from the **data-side info file**
+(``<data_root>/info.json``) that is stored *alongside* the video files by
+the capture pipeline.  This keeps camera-specific data out of the project
+config and makes it easy to swap in a new dataset without editing any
+project file.
+
+Supported camera-entry formats in the data-side info file
+----------------------------------------------------------
 New format (``train_videos[]``):
     {
         "file_name": "train00.mp4",
@@ -25,6 +36,12 @@ Legacy format (``cameras[]``):
 
 Both formats are normalised to the same internal representation before
 further processing.
+
+Fallback behaviour
+------------------
+If ``<data_root>/info.json`` does not exist the code falls back to reading
+camera entries from the project config (backwards compatible with any config
+that still contains ``train_videos[]`` or ``cameras[]``).
 """
 
 import json
@@ -44,9 +61,29 @@ from torch.utils.data import Dataset
 # ---------------------------------------------------------------------------
 
 def load_config(config_path: str) -> dict:
-    """Load config/info.json."""
+    """Load the project-level config (e.g. config/info.json)."""
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_data_info(data_root: str) -> dict:
+    """
+    Load the data-side info file from ``<data_root>/info.json``.
+
+    This file is provided by the capture pipeline alongside the video files
+    and contains camera poses, intrinsics, and video metadata
+    (``train_videos[]`` or ``cameras[]`` entries).
+
+    Returns an empty dict (not an error) if the file does not exist, so that
+    callers can fall back to a project-config that still embeds camera entries.
+    """
+    info_path = os.path.join(data_root, "info.json")
+    if not os.path.isfile(info_path):
+        return {}
+    with open(info_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    print(f"[dataset] loaded data-side info from '{info_path}'")
+    return data
 
 
 def normalize_camera_entry(entry: dict) -> dict:
@@ -100,15 +137,30 @@ def normalize_camera_entry(entry: dict) -> dict:
         }
 
 
-def get_camera_entries(cfg: dict) -> List[dict]:
+def get_camera_entries(cfg: dict, data_info: dict = None) -> List[dict]:
     """
-    Return a list of normalised camera entries from either config format.
+    Return a list of normalised camera entries.
 
-    Tries ``train_videos`` first (new format), then falls back to
-    ``cameras`` (legacy format).
+    Look-up order:
+    1. ``data_info`` (the data-side ``<data_root>/info.json``) — preferred,
+       because camera poses should live next to the video files, not in the
+       project config.
+    2. ``cfg`` (the project-level config) — fallback for backwards
+       compatibility with configs that still embed ``train_videos[]`` or
+       ``cameras[]``.
+
+    Parameters
+    ----------
+    cfg       : project-level config dict (training hyper-parameters)
+    data_info : data-side info dict loaded from ``<data_root>/info.json``;
+                pass ``None`` or ``{}`` to skip.
     """
-    raw_list = cfg.get("train_videos") or cfg.get("cameras", [])
-    return [normalize_camera_entry(e) for e in raw_list]
+    # Prefer the data-side info file
+    for source in (data_info or {}, cfg):
+        raw_list = source.get("train_videos") or source.get("cameras")
+        if raw_list:
+            return [normalize_camera_entry(e) for e in raw_list]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +428,10 @@ class DustDataset(Dataset):
         self.device = device
         cfg_train = self.cfg["training"]
 
+        # Load camera poses and video metadata from the data-side info file.
+        # Falls back to the project config if the file does not exist.
+        data_info = load_data_info(data_root)
+
         bg_estimator = BackgroundEstimator(n_frames=bg_frames, method=bg_method)
 
         all_rays_o:    List[np.ndarray] = []
@@ -387,7 +443,7 @@ class DustDataset(Dataset):
         max_frame_idx = 0
         frame_rate = 25.0   # default; overwritten by first camera entry
 
-        camera_entries = get_camera_entries(self.cfg)
+        camera_entries = get_camera_entries(self.cfg, data_info)
         print(f"[DustDataset] Loading data from '{data_root}' …")
 
         for cam in camera_entries:

@@ -279,11 +279,16 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train DustNeRF")
-    p.add_argument("--config",      default="config/info.json")
-    p.add_argument("--data",        default="data")
-    p.add_argument("--out",         default="outputs")
-    p.add_argument("--resume",      action="store_true")
-    p.add_argument("--white-bkgd",  action="store_true")
+    p.add_argument("--config",     default="config/info.json",
+                   help="Path to project-level config (training hyper-params)")
+    p.add_argument("--data",       default="data",
+                   help="Data directory containing info.json and video files")
+    p.add_argument("--out",        default="outputs",
+                   help="Output directory")
+    p.add_argument("--resume",     action="store_true",
+                   help="Resume from latest checkpoint")
+    p.add_argument("--white-bkgd", action="store_true",
+                   help="Use white background")
     return p.parse_args()
 
 

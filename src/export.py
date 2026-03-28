@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .dataset import load_config, get_camera_entries, get_intrinsics, get_c2w
+from .dataset import load_config, load_data_info, get_camera_entries, get_intrinsics, get_c2w
 from .model import DustNeRF
 
 
@@ -281,9 +281,14 @@ def package(export_dir, out_archive):
 # Scene-bounds helper (supports both config formats)
 # ---------------------------------------------------------------------------
 
-def scene_bounds_from_config(cfg: dict, margin: float = 2.0):
-    """Return (scene_min, scene_max) from camera positions in either format."""
-    camera_entries = get_camera_entries(cfg)
+def scene_bounds_from_config(cfg: dict, data_info: dict = None,
+                             margin: float = 2.0):
+    """Return (scene_min, scene_max) from camera positions.
+
+    Camera entries are resolved from ``data_info`` first (data-side
+    ``<data_root>/info.json``), with ``cfg`` as fallback.
+    """
+    camera_entries = get_camera_entries(cfg, data_info)
     positions = []
     for cam in camera_entries:
         c2w = np.array(cam["transform_matrix"], dtype=np.float32)
@@ -308,6 +313,9 @@ def export(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[export] device = {device}")
 
+    # Load camera poses from the data-side info file (falls back to cfg)
+    data_info = load_data_info(args.data) if args.data else {}
+
     out_dir    = Path(args.out)
     export_dir = out_dir / "export"
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -326,11 +334,10 @@ def export(args):
           f"(step {ckpt.get('step','?')}, n_frames={n_frames})")
 
     # ---- Scene bounds ----
-    scene_min, scene_max = scene_bounds_from_config(cfg)
+    scene_min, scene_max = scene_bounds_from_config(cfg, data_info)
     print(f"[export] scene bounds: {scene_min} → {scene_max}")
 
     # ---- Time-averaged 3D grid ----
-    # Use the middle frame for the "canonical" averaged view when n_frames > 1
     mid_frame = (n_frames // 2) if n_frames > 1 else None
     print(f"[export] evaluating time-averaged grid (resolution={resolution}³) …")
     density, dust_prob = evaluate_density_grid(
@@ -354,7 +361,7 @@ def export(args):
 
     # ---- Save cameras JSON ----
     cameras_out = []
-    for cam in get_camera_entries(cfg):
+    for cam in get_camera_entries(cfg, data_info):
         cameras_out.append({
             "id": cam["id"],
             "intrinsics": {
@@ -362,7 +369,7 @@ def export(args):
                 "cx":   cam["cx"],   "cy":   cam["cy"],
                 "w":    cam["w"],    "h":    cam["h"],
             },
-            "c2w":       cam["transform_matrix"],
+            "c2w":        cam["transform_matrix"],
             "frame_rate": cam["frame_rate"],
             "frame_num":  cam["frame_num"],
         })
@@ -384,8 +391,7 @@ def export(args):
 
     # ---- Per-frame temporal grids ----
     if do_temporal and n_frames > 1:
-        # Derive fps from the first camera entry (all cameras are synchronised)
-        cam_entries = get_camera_entries(cfg)
+        cam_entries = get_camera_entries(cfg, data_info)
         fps         = cam_entries[0]["frame_rate"] if cam_entries else 25.0
         frame_times = np.arange(n_frames, dtype=np.float32) / fps
 
@@ -413,9 +419,14 @@ def export(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Export DustNeRF density grid")
-    p.add_argument("--config",  default="config/info.json")
-    p.add_argument("--ckpt",    required=True)
-    p.add_argument("--out",     default="outputs")
+    p.add_argument("--config",  default="config/info.json",
+                   help="Path to project-level config (training hyper-params)")
+    p.add_argument("--data",    default="data",
+                   help="Data directory containing info.json and video files")
+    p.add_argument("--ckpt",    required=True,
+                   help="Path to checkpoint .pt file")
+    p.add_argument("--out",     default="outputs",
+                   help="Output directory")
     return p.parse_args()
 
 
