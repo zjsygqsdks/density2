@@ -20,6 +20,12 @@ data/
 # Outputs
 outputs/
 
+# Downloaded results
+results/
+
+# Server credentials — NEVER commit
+server.env
+
 # Editor / OS
 .DS_Store
 *.swp
@@ -28,3 +34,6 @@ outputs/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Config backups
+*.bak

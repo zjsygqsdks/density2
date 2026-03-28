@@ -213,7 +213,7 @@ def print_summary(density: np.ndarray, dust_prob: np.ndarray, grid_min, grid_max
     print("=" * 60)
     print("  DustNeRF Export — Summary")
     print("=" * 60)
-    print(f"  Grid resolution  : {density.shape[0]}³")
+    print(f"  Grid resolution  : {density.shape[0]}^3")
     print(f"  Scene bounds min : {grid_min}")
     print(f"  Scene bounds max : {grid_max}")
     print(f"  Scene volume     : {scene_vol:.3f} m³")

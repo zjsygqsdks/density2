@@ -14,6 +14,7 @@ Features
 """
 
 import argparse
+import json
 import os
 import time
 from pathlib import Path
@@ -107,6 +108,21 @@ def load_checkpoint(
 
 
 # ---------------------------------------------------------------------------
+# JSONL metrics logger (for offline analysis via src/analyze.py)
+# ---------------------------------------------------------------------------
+
+class JsonlLogger:
+    """Append one JSON record per log step to <out_dir>/train_metrics.jsonl."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def log(self, record: dict):
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
 
@@ -165,6 +181,9 @@ def train(args):
     # ---- TensorBoard ----
     writer = SummaryWriter(log_dir=str(out_dir / "logs"))
 
+    # ---- JSONL metrics logger (offline-analysis friendly) ----
+    jsonl_logger = JsonlLogger(str(out_dir / "train_metrics.jsonl"))
+
     # ---- Render settings ----
     near = cfg_train["near"]
     far  = cfg_train["far"]
@@ -173,6 +192,7 @@ def train(args):
     max_steps = cfg_train["max_steps"]
     save_every = cfg_train["save_every"]
     log_every  = cfg_train["log_every"]
+    dust_weight_alpha = cfg_train.get("dust_weight_alpha", 5.0)
 
     # ---- Training loop ----
     step = start_step
@@ -203,8 +223,8 @@ def train(args):
             perturb=True, white_bkgd=args.white_bkgd,
         )
 
-        loss_c = photometric_loss(out["coarse/rgb"], gt_rgb, weight)
-        loss_f = photometric_loss(out["fine/rgb"],   gt_rgb, weight)
+        loss_c = photometric_loss(out["coarse/rgb"], gt_rgb, weight, dust_weight_alpha)
+        loss_f = photometric_loss(out["fine/rgb"],   gt_rgb, weight, dust_weight_alpha)
         loss_dust = dust_regularisation(out["fine/dust"], weight)
         loss = loss_c + loss_f + 0.1 * loss_dust
 
@@ -235,6 +255,17 @@ def train(args):
             writer.add_scalar("loss/dust_reg",loss_dust.item(), step)
             writer.add_scalar("psnr/fine",    psnr,          step)
             writer.add_scalar("lr",           lr,            step)
+
+            jsonl_logger.log({
+                "step":      step,
+                "loss":      round(loss.item(),      6),
+                "loss_c":    round(loss_c.item(),    6),
+                "loss_f":    round(loss_f.item(),    6),
+                "loss_dust": round(loss_dust.item(), 6),
+                "psnr":      round(psnr,             4),
+                "lr":        lr,
+                "elapsed_s": round(elapsed,          1),
+            })
 
         # ---- checkpoint ----
         if step % save_every == 0 or step == max_steps:

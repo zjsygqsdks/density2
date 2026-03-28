@@ -120,7 +120,8 @@
     "frames_per_video": 60,
     "frame_skip": 5,
     "background_frames": 30,
-    "dust_threshold": 0.05
+    "dust_threshold": 0.05,
+    "dust_weight_alpha": 5.0
   },
   "export": {
     "grid_resolution": 128,
